@@ -785,7 +785,9 @@ func (p *MinQueriesPlanner) selectLocation(ctx *PlanningContext, fieldName strin
 func (p *MinQueriesPlanner) groupSelectionSet(ctx *PlanningContext, config *extractSelectionConfig) (map[string]ast.SelectionSet, map[string]ast.FragmentDefinitionList, error) {
 	locationFields := map[string]ast.SelectionSet{}
 	locationFragments := map[string]ast.FragmentDefinitionList{}
-
+	var nodeTypename *ast.Field
+	nodeTypeNameLocations := map[string]ast.SelectionSet{}
+	nodeTypeLocationFields := map[string]ast.SelectionSet{}
 	// split each selection into groups of selection sets to be sent to a single service
 	for _, selection := range config.selection {
 		// each kind of selection contributes differently to the final selection set
@@ -803,14 +805,20 @@ func (p *MinQueriesPlanner) groupSelectionSet(ctx *PlanningContext, config *extr
 				SelectionSet:     selection.SelectionSet,
 			}
 
-			// look up the location for this field
-			possibleLocations, err := config.locations.URLFor(config.parentType, selection.Name)
-			if err != nil {
-				return nil, nil, err
+
+			if config.parentType == typeNameNode && selection.Name == typenameField && config.parentLocation == internalSchemaLocation {
+				nodeTypename = field
+			} else{
+				// look up the location for this field
+				possibleLocations, err := config.locations.URLFor(config.parentType, selection.Name)
+				if err != nil {
+					return nil, nil, err
+				}
+
+				location := p.selectLocation(ctx, selection.Name, possibleLocations, config)
+				locationFields[location] = append(locationFields[location], field)
 			}
 
-			location := p.selectLocation(ctx, selection.Name, possibleLocations, config)
-			locationFields[location] = append(locationFields[location], field)
 		case *ast.FragmentSpread:
 			ctx.Gateway.logger.Debug("Encountered fragment spread ", selection.Name)
 
@@ -851,7 +859,12 @@ func (p *MinQueriesPlanner) groupSelectionSet(ctx *PlanningContext, config *extr
 					}
 
 					fieldLocation := p.selectLocation(ctx, field.Name, fieldLocations, config)
-					fragmentLocations[fieldLocation] = append(fragmentLocations[fieldLocation], field)
+
+					if field.Name == typenameField && config.parentLocation == internalSchemaLocation && len(config.insertionPoint) == 1 && config.insertionPoint[0] == typeNameNode {
+						nodeTypename = field
+					} else{
+						fragmentLocations[fieldLocation] = append(fragmentLocations[fieldLocation], field)
+					}
 
 				case *ast.FragmentSpread, *ast.InlineFragment:
 					// non-field selections will be handled in the next tick
@@ -889,15 +902,35 @@ func (p *MinQueriesPlanner) groupSelectionSet(ctx *PlanningContext, config *extr
 			for _, fragmentSelection := range selection.SelectionSet {
 				switch fragmentSelection := fragmentSelection.(type) {
 				case *ast.Field:
-					// look up the location of the field
-					fieldLocations, err := config.locations.URLFor(selection.TypeCondition, fragmentSelection.Name)
-					if err != nil {
-						return nil, nil, err
+					var fieldLocation string
+					if !(fragmentSelection.Name == typenameField && config.parentLocation == internalSchemaLocation && len(config.insertionPoint) == 1 && config.insertionPoint[0] == typeNameNode) {
+						// look up the location of the field
+						fieldLocations, err := config.locations.URLFor(selection.TypeCondition, fragmentSelection.Name)
+						if err != nil {
+							return nil, nil, err
+						}
+
+						// add the field to the location, respecting parent location priority
+						fieldLocation = p.selectLocation(ctx, fragmentSelection.Name, fieldLocations, config)
+						if len(config.insertionPoint) == 1 && config.insertionPoint[0] == typeNameNode{
+							nodeTypeNameLocations[fieldLocation] = append(nodeTypeNameLocations[fieldLocation], fragmentSelection)
+						} else{
+							fragmentLocations[fieldLocation] = append(fragmentLocations[fieldLocation], fragmentSelection)
+						}
+						
+					}	else {
+						field := &ast.Field{
+							Name:             fragmentSelection.Name,
+							Alias:            fragmentSelection.Alias,
+							Directives:       fragmentSelection.Directives,
+							Arguments:        fragmentSelection.Arguments,
+							Definition:       fragmentSelection.Definition,
+							ObjectDefinition: fragmentSelection.ObjectDefinition,
+							SelectionSet:     fragmentSelection.SelectionSet,
+						}
+						nodeTypename = field
 					}
 
-					// add the field to the location, respecting parent location priority
-					fieldLocation := p.selectLocation(ctx, fragmentSelection.Name, fieldLocations, config)
-					fragmentLocations[fieldLocation] = append(fragmentLocations[fieldLocation], fragmentSelection)
 
 				case *ast.FragmentSpread, *ast.InlineFragment:
 					// non-field selections will be handled in the next tick
@@ -915,9 +948,30 @@ func (p *MinQueriesPlanner) groupSelectionSet(ctx *PlanningContext, config *extr
 					SelectionSet:  selectionSet,
 				})
 			}
+
+						// for each bundle under a fragment
+			for location, selectionSet := range nodeTypeNameLocations {
+				// add the fragment spread to the selection set for this location
+				nodeTypeLocationFields[location] = append(nodeTypeLocationFields[location], &ast.InlineFragment{
+					TypeCondition: selection.TypeCondition,
+					Directives:    selection.Directives,
+					SelectionSet:  selectionSet,
+				})
+			}
 		}
 	}
-
+	if nodeTypename != nil{
+		for location, selectionSet := range nodeTypeLocationFields{
+			for selection := range selectionSet{
+			}
+			selectionSet = append(selectionSet, nodeTypename)
+			locationFields[location] = append(locationFields[location], &ast.InlineFragment{
+				TypeCondition: selection.TypeCondition,
+				Directives:    selection.Directives,
+				SelectionSet:  selectionSet,
+			})
+		}
+	}
 	return locationFields, locationFragments, nil
 }
 
